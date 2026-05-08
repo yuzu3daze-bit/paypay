@@ -1,621 +1,185 @@
 import discord
-from discord.ext import commands, tasks
-from discord import app_commands
+from discord.ext import commands
+from discord import ui
+from paypaypy import PayPay
 import json
 import os
-import requests
-import threading
-from datetime import datetime
-from flask import Flask
+import uuid
 
-app = Flask(__name__)
+# --- 環境変数と設定 ---
+# TOKENなどはRenderのダッシュボード（Environment Variables）で設定することを推奨します
+TOKEN = os.getenv("DISCORD_TOKEN", "YOUR_BOT_TOKEN_HERE")
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))  # あなたのDiscord ID
 
-# ===== 設定 =====
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-LICENSE_KEY   = os.getenv("LICENSE_KEY")
-LOGIN_API_URL = "https://plogin-api.xvps.jp"
-USER_DATA_DIR  = "solo_user_data"
-ALLOWED_USERS  = [1455012819291340862]  # 使用を許可するDiscordユーザーID
+DATA_FILE = "vending_machine.json"
 
-# ===== アクセス制御 =====
-def is_whitelisted(user_id: int) -> bool:
-    return user_id in ALLOWED_USERS
-
-# ===== ユーザー別トークン管理 =====
-def user_dir(user_id: int) -> str:
-    path = os.path.join(USER_DATA_DIR, str(user_id))
-    os.makedirs(path, exist_ok=True)
-    return path
-
-def user_tokens_path(user_id: int) -> str:
-    return os.path.join(user_dir(user_id), "tokens.json")
-
-def load_user_data(user_id: int) -> dict:
-    path = user_tokens_path(user_id)
-    if os.path.exists(path):
-        with open(path, "r") as f:
-            return json.load(f)
-    return {"active": None, "accounts": {}}
-
-def save_user_data(user_id: int, data: dict):
-    with open(user_tokens_path(user_id), "w") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-
-def get_active_tokens(user_id: int) -> tuple:
-    data = load_user_data(user_id)
-    name = data.get("active")
-    if not name or name not in data.get("accounts", {}):
-        return None, None
-    return name, data["accounts"][name]
-
-def save_account(user_id: int, name: str, tokens: dict):
-    data = load_user_data(user_id)
-    if "accounts" not in data:
-        data["accounts"] = {}
-    data["accounts"][name] = tokens
-    if data.get("active") is None:
-        data["active"] = name
-    save_user_data(user_id, data)
-
-def set_active(user_id: int, name: str) -> bool:
-    data = load_user_data(user_id)
-    if name not in data.get("accounts", {}):
-        return False
-    data["active"] = name
-    save_user_data(user_id, data)
-    return True
-
-def delete_account(user_id: int, name: str) -> bool:
-    data = load_user_data(user_id)
-    if name not in data.get("accounts", {}):
-        return False
-    del data["accounts"][name]
-    if data.get("active") == name:
-        remaining = list(data["accounts"].keys())
-        data["active"] = remaining[0] if remaining else None
-    save_user_data(user_id, data)
-    return True
-
-def list_accounts(user_id: int) -> list:
-    return list(load_user_data(user_id).get("accounts", {}).keys())
-
-# ===== PayPayクライアント取得 =====
-def get_paypay(user_id: int):
-    from PayPaython_mobile import PayPay, PayPayLoginError
-    name, tokens = get_active_tokens(user_id)
-    if not tokens or not tokens.get("access_token"):
-        return None, None, None
-    try:
-        pp = PayPay(access_token=tokens["access_token"])
-        return pp, tokens, name
-    except PayPayLoginError:
-        return _try_refresh(user_id, name, tokens)
-
-def _try_refresh(user_id: int, name: str, tokens: dict):
-    from PayPaython_mobile import PayPay, PayPayLoginError
-    try:
-        pp = PayPay(access_token=tokens["access_token"])
-        pp.token_refresh(tokens["refresh_token"])
-        new_tokens = {
-            "access_token":  pp.access_token,
-            "refresh_token": pp.refresh_token,
-            "device_uuid":   tokens.get("device_uuid", ""),
-        }
-        save_account(user_id, name, new_tokens)
-        return pp, new_tokens, name
-    except Exception:
-        return None, None, None
-
-# ===== ログイン代行API =====
-def login_step1(phone: str, password: str, device_uuid: str = None) -> dict:
-    payload = {"phone": phone, "password": password}
-    if device_uuid:
-        payload["device_uuid"] = device_uuid
-    r = requests.post(
-        f"{LOGIN_API_URL}/login",
-        headers={"Content-Type": "application/json", "X-License-Key": LICENSE_KEY},
-        json=payload, timeout=15
-    )
-    return r.json()
-
-def login_step2(session_id: str, auth_url: str) -> dict:
-    r = requests.post(
-        f"{LOGIN_API_URL}/login/complete",
-        headers={"Content-Type": "application/json", "X-License-Key": LICENSE_KEY},
-        json={"session_id": session_id, "auth_url": auth_url},
-        timeout=15
-    )
-    return r.json()
-
-# ===== WLチェックデコレータ =====
-async def check_whitelist(interaction: discord.Interaction) -> bool:
-    if not is_whitelisted(interaction.user.id):
-        await interaction.response.send_message(
-            "❌ 利用権限がありません。管理者にお問い合わせください。",
-            ephemeral=True
-        )
-        return False
-    return True
-
-# ===== Modals =====
-class LoginModal(discord.ui.Modal, title="PayPay ログイン"):
-    account_name = discord.ui.TextInput(label="Bot上で保存する名前", placeholder="メイン / サブ など")
-    phone        = discord.ui.TextInput(label="電話番号",           placeholder="09012345678")
-    password     = discord.ui.TextInput(label="パスワード",         placeholder="PayPayのパスワード")
-
-    def __init__(self, bot_ref):
-        super().__init__()
-        self.bot_ref = bot_ref
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        uid          = interaction.user.id
-        account_name = str(self.account_name).strip()
-        phone        = str(self.phone).strip()
-        password     = str(self.password).strip()
-
-        data     = load_user_data(uid)
-        existing = data.get("accounts", {}).get(account_name, {})
-        device_uuid = existing.get("device_uuid")
-
-        result = login_step1(phone, password, device_uuid)
-        if result.get("status_code") != "P0000":
-            await interaction.followup.send(
-                f"❌ ステップ1失敗: {result.get('message')} (debug: {result.get('debug_code')})",
-                ephemeral=True
-            )
-            return
-
-        session_id = result["data"]["session_id"]
-        self.bot_ref.pending_sessions[uid] = {
-            "session_id":   session_id,
-            "account_name": account_name,
-        }
-        await interaction.followup.send(
-            f"✅ ステップ1完了！（アカウント: **{account_name}**）\n"
-            "PayPayアプリまたはSMSに届いた**認証URL**を `/paypay auth` で入力してください。\n"
-            "⏳ 5分以内に入力してください。",
-            ephemeral=True
-        )
-
-
-class AuthModal(discord.ui.Modal, title="認証URL入力"):
-    auth_url = discord.ui.TextInput(
-        label="認証URL または ID",
-        placeholder="https://www.paypay.ne.jp/portal/oauth2/l?id=XXXXXX",
-        style=discord.TextStyle.long
-    )
-
-    def __init__(self, bot_ref):
-        super().__init__()
-        self.bot_ref = bot_ref
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        uid     = interaction.user.id
-        pending = self.bot_ref.pending_sessions.get(uid)
-        if not pending:
-            await interaction.followup.send(
-                "❌ セッションが見つかりません。先に `/paypay login` を実行してください。",
-                ephemeral=True
-            )
-            return
-
-        result = login_step2(pending["session_id"], str(self.auth_url))
-        if result.get("status_code") != "P0000":
-            await interaction.followup.send(
-                f"❌ ログイン失敗: {result.get('message')} (debug: {result.get('debug_code')})",
-                ephemeral=True
-            )
-            return
-
-        account_name = pending["account_name"]
-        d = result["data"]
-        save_account(uid, account_name, {
-            "access_token":  d["access_token"],
-            "refresh_token": d["refresh_token"],
-            "device_uuid":   d["device_uuid"],
-        })
-        del self.bot_ref.pending_sessions[uid]
-        await interaction.followup.send(
-            f"✅ ログイン完了！アカウント **{account_name}** を保存しました。",
-            ephemeral=True
-        )
-
-# ===== Bot =====
-class PayPayBot(commands.Bot):
-    def __init__(self):
-        intents = discord.Intents.default()
-        super().__init__(command_prefix="!", intents=intents)
-        self.pending_sessions: dict = {}
-
-    async def setup_hook(self):
-        await self.tree.sync()
-
-    async def on_ready(self):
-        print(f"[Pay管理Bot Solo] ready: {self.user}")
-        alive_loop.start()
-
-bot = PayPayBot()
-
-# ===== alive定期実行（全ユーザー全アカウント）=====
-@tasks.loop(minutes=30)
-async def alive_loop():
-    from PayPaython_mobile import PayPay
-    if not os.path.exists(USER_DATA_DIR):
-        return
-    for uid_str in os.listdir(USER_DATA_DIR):
+def load_data():
+    if os.path.exists(DATA_FILE):
         try:
-            data = load_user_data(int(uid_str))
-        except ValueError:
-            continue
-        for name, tokens in data.get("accounts", {}).items():
-            try:
-                pp = PayPay(access_token=tokens["access_token"])
-                pp.alive()
-                print(f"[Pay管理Bot alive] {uid_str}/{name} OK")
-            except Exception as e:
-                print(f"[Pay管理Bot alive] {uid_str}/{name} エラー: {e}")
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except:
+            pass
+    return {"admins": [], "phone": None, "password": None, "items": {}}
 
-# ===== ヘルパー =====
-async def require_login(interaction: discord.Interaction):
-    pp, tokens, name = get_paypay(interaction.user.id)
-    if not pp:
-        await interaction.followup.send(
-            "❌ 未ログインまたはトークン期限切れ。`/paypay login` でログインしてください。",
-            ephemeral=True
-        )
-    return pp, name
+def save_data(data):
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
 
-# ===== コマンドグループ =====
-paypay_group = app_commands.Group(name="paypay", description="PayPay操作コマンド")
+db = load_data()
 
+# --- ボット設定 ---
+intents = discord.Intents.all()
+bot = commands.Bot(command_prefix="!", intents=intents)
+pp_client = None
 
-@paypay_group.command(name="login", description="PayPayにログインする（ステップ1）")
-async def paypay_login(interaction: discord.Interaction):
-    if not await check_whitelist(interaction):
-        return
-    await interaction.response.send_modal(LoginModal(bot))
+# --- 権限チェック用 ---
+def is_admin_check(ctx):
+    return ctx.author.id == OWNER_ID or ctx.author.id in db["admins"]
 
+# --- UI: 商品選択パネル ---
+class VendingView(ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
 
-@paypay_group.command(name="auth", description="認証URLを入力してログインを完了する（ステップ2）")
-async def paypay_auth(interaction: discord.Interaction):
-    if not await check_whitelist(interaction):
-        return
-    await interaction.response.send_modal(AuthModal(bot))
+    @ui.button(label="🛒 商品一覧を見る", style=discord.ButtonStyle.green, custom_id="view_items")
+    async def view_items(self, interaction: discord.Interaction, button: ui.Button):
+        items = db.get("items", {})
+        if not items:
+            return await interaction.response.send_message("現在、在庫のある商品はありません。", ephemeral=True)
 
+        embed = discord.Embed(title="🛒 商品ラインナップ", color=0x2ecc71)
+        select = ui.Select(placeholder="購入したい商品を選んでください")
 
-@paypay_group.command(name="accounts", description="登録済みアカウント一覧を表示する")
-async def paypay_accounts(interaction: discord.Interaction):
-    if not await check_whitelist(interaction):
-        return
-    await interaction.response.defer(ephemeral=True)
-    uid    = interaction.user.id
-    data   = load_user_data(uid)
-    active = data.get("active")
-    accounts = list(data.get("accounts", {}).keys())
-    if not accounts:
-        await interaction.followup.send("アカウントが登録されていません。", ephemeral=True)
-        return
-    lines = [f"{'▶' if a == active else '　'} {a}" for a in accounts]
-    embed = discord.Embed(title="📋 登録アカウント", description="\n".join(lines), color=0xFF0000)
-    embed.set_footer(text="▶ = アクティブ")
-    await interaction.followup.send(embed=embed, ephemeral=True)
+        has_stock = False
+        for item_id, info in items.items():
+            stock_count = len(info['stock'])
+            embed.add_field(
+                name=f"📦 {info['name']}",
+                value=f"価格: `{info['price']}円` | 在庫: `{stock_count}個`",
+                inline=False
+            )
+            if stock_count > 0:
+                select.add_option(label=f"{info['name']} ({info['price']}円)", value=item_id)
+                has_stock = True
 
+        if not has_stock:
+            return await interaction.response.send_message("申し訳ありません。現在すべての商品が売り切れです。", ephemeral=True)
 
-@paypay_group.command(name="switch", description="使用するアカウントを切り替える")
-async def paypay_switch(interaction: discord.Interaction):
-    if not await check_whitelist(interaction):
-        return
-    await interaction.response.defer(ephemeral=True)
-    uid      = interaction.user.id
-    data     = load_user_data(uid)
-    accounts = list(data.get("accounts", {}).keys())
-    if not accounts:
-        await interaction.followup.send("❌ アカウントが登録されていません。", ephemeral=True)
-        return
-    active = data.get("active")
-    await interaction.followup.send(
-        "切り替えるアカウントを選択してください：",
-        view=SwitchView(uid, accounts, active),
-        ephemeral=True
+        async def select_callback(it: discord.Interaction):
+            item_id = select.values[0]
+            item = db["items"][item_id]
+            await it.response.send_message(
+                f"✅ **{item['name']}** が選択されました。\n"
+                f"**{item['price']}円** のPayPay送金リンクをこのチャットに送信してください。\n"
+                "受け取り完了後、自動的にDMで商品（シリアルコード等）をお送りします。", ephemeral=True)
+        
+        select.callback = select_callback
+        view = ui.View()
+        view.add_item(select)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user.name}")
+    # 起動時にパネルボタンを有効化（永続化）
+    bot.add_view(VendingView())
+    
+    # 以前のログイン情報があれば復元試行
+    global pp_client
+    if db.get("phone") and db.get("password"):
+        try:
+            pp_client = PayPay(phone=db["phone"], password=db["password"])
+            print("PayPay Session Restored")
+        except:
+            print("PayPay Login Required")
+
+# --- コマンド一覧 ---
+
+@bot.command()
+@commands.check(is_admin_check)
+async def set_panel(ctx):
+    embed = discord.Embed(
+        title="🏧 PayPay自動販売機",
+        description="下のボタンを押して商品を選択してください。\nリンクを貼るだけで自動購入可能です。",
+        color=0xf1c40f
     )
+    await ctx.send(embed=embed, view=VendingView())
 
+@bot.command()
+@commands.check(is_admin_check)
+async def add_item(ctx, name: str, price: int):
+    item_id = str(uuid.uuid4())[:8]
+    db["items"][item_id] = {"name": name, "price": price, "stock": []}
+    save_data(db)
+    await ctx.send(f"✅ 商品登録完了: **{name}** ({price}円)\nID: `{item_id}`")
 
-@paypay_group.command(name="delete", description="アカウントを削除する")
-async def paypay_delete(interaction: discord.Interaction):
-    if not await check_whitelist(interaction):
-        return
-    await interaction.response.defer(ephemeral=True)
-    uid      = interaction.user.id
-    accounts = list_accounts(uid)
-    if not accounts:
-        await interaction.followup.send("❌ アカウントが登録されていません。", ephemeral=True)
-        return
-    await interaction.followup.send(
-        "削除するアカウントを選択してください：",
-        view=DeleteView(uid, accounts),
-        ephemeral=True
-    )
+@bot.command()
+@commands.check(is_admin_check)
+async def add_stock(ctx, item_id: str, *, content: str):
+    if item_id in db["items"]:
+        db["items"][item_id]["stock"].append(content)
+        save_data(db)
+        await ctx.send(f"📦 在庫を追加しました。現在庫数: {len(db['items'][item_id]['stock'])}")
+    else:
+        await ctx.send("❌ IDが正しくありません。")
 
-
-@paypay_group.command(name="balance", description="PayPay残高を確認する")
-async def paypay_balance(interaction: discord.Interaction):
-    if not await check_whitelist(interaction):
-        return
-    await interaction.response.defer(ephemeral=True)
-    from PayPaython_mobile import PayPayLoginError
-
-    pp, name = await require_login(interaction)
-    if not pp:
-        return
-
+@bot.command()
+@commands.check(is_admin_check)
+async def login(ctx, phone, password):
+    global pp_client
     try:
-        r  = pp.get_balance()
-        ws = r.raw["payload"]["walletSummary"]
-        wd = r.raw["payload"]["walletDetail"]
-
-        def bal(obj):
-            if obj is None: return 0
-            return obj.get("balance") or 0
-
-        all_total = bal(ws.get("allTotalBalanceInfo"))
-        emoney    = bal(wd.get("emoneyBalanceInfo"))
-        prepaid   = bal(wd.get("prepaidBalanceInfo"))
-        points    = bal(wd.get("cashBackBalanceInfo"))
-        pending   = bal(wd.get("cashBackPendingInfo"))
-
-        embed = discord.Embed(title=f"💰 PayPay残高（{name}）", color=0xFF0000)
-        embed.add_field(name="合計",           value=f"¥{all_total:,}", inline=False)
-        embed.add_field(name="マネー",         value=f"¥{emoney:,}",   inline=True)
-        embed.add_field(name="マネーライト",   value=f"¥{prepaid:,}",  inline=True)
-        embed.add_field(name="ポイント",       value=f"¥{points:,}",   inline=True)
-        if pending:
-            embed.add_field(name="付与予定ポイント", value=f"¥{pending:,}", inline=True)
-        embed.set_footer(text=f"確認日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        await interaction.followup.send(embed=embed, ephemeral=True)
-    except PayPayLoginError:
-        await interaction.followup.send("❌ トークンが無効です。`/paypay login` で再ログインしてください。", ephemeral=True)
+        pp_client = PayPay(phone=phone, password=password)
+        db["phone"] = phone
+        db["password"] = password
+        save_data(db)
+        await ctx.send("📲 OTP(SMS)を受信したら `!otp コード` を入力してください。")
     except Exception as e:
-        await interaction.followup.send(f"❌ エラー: {e}", ephemeral=True)
+        await ctx.send(f"❌ エラー: {e}")
 
-
-@paypay_group.command(name="receive", description="受け取りリンクを消化する")
-@app_commands.describe(link="PayPay受け取りリンク（URL または ID）")
-async def paypay_receive(interaction: discord.Interaction, link: str):
-    if not await check_whitelist(interaction):
-        return
-    await interaction.response.defer(ephemeral=True)
-    from PayPaython_mobile import PayPayLoginError
-
-    pp, name = await require_login(interaction)
-    if not pp:
-        return
-
+@bot.command()
+@commands.check(is_admin_check)
+async def otp(ctx, code):
+    if not pp_client: return
     try:
-        link_info = pp.link_check(link)
-        if link_info.status != "PENDING":
-            await interaction.followup.send(f"❌ このリンクは受け取れません（ステータス: {link_info.status}）", ephemeral=True)
-            return
-        pp.link_receive(link, link_info=link_info)
-        embed = discord.Embed(title=f"✅ 受け取り完了（{name}）", color=0x00FF00)
-        embed.add_field(name="受け取り金額", value=f"¥{link_info.amount:,}" if link_info.amount else "不明")
-        await interaction.followup.send(embed=embed, ephemeral=True)
-    except PayPayLoginError:
-        await interaction.followup.send("❌ トークンが無効です。`/paypay login` で再ログインしてください。", ephemeral=True)
+        pp_client.otp_login(code)
+        await ctx.send("✅ PayPayログインに成功しました。")
     except Exception as e:
-        await interaction.followup.send(f"❌ エラー: {e}", ephemeral=True)
+        await ctx.send(f"❌ 認証失敗: {e}")
 
+# --- メッセージ監視 (自動受け取り) ---
+@bot.event
+async def on_message(message):
+    if message.author.bot: return
+    await bot.process_commands(message)
 
-@paypay_group.command(name="send", description="送金する")
-@app_commands.describe(receiver_id="送り先のExternal User ID", amount="送金額（円）")
-async def paypay_send(interaction: discord.Interaction, receiver_id: str, amount: int):
-    if not await check_whitelist(interaction):
-        return
-    await interaction.response.defer(ephemeral=True)
-    from PayPaython_mobile import PayPayLoginError
+    if "https://pay.paypay.ne.jp/" in message.content and pp_client:
+        url = message.content.split()[0]
+        try:
+            info = pp_client.get_link_info(url)
+            amount = info.get("order_amount")
+            
+            # 金額が一致し、在庫がある商品を探す
+            target_id = None
+            for i_id, i_info in db["items"].items():
+                if i_info["price"] == amount and len(i_info["stock"]) > 0:
+                    target_id = i_id
+                    break
+            
+            if target_id:
+                if pp_client.accept_link(url):
+                    content = db["items"][target_id]["stock"].pop(0)
+                    save_data(db)
+                    try:
+                        await message.author.send(f"🛍️ 購入ありがとうございます！\n商品: **{db['items'][target_id]['name']}**\n内容: `{content}`")
+                        await message.channel.send(f"✅ {message.author.mention} 購入完了！DMに商品を送信しました。")
+                    except:
+                        await message.channel.send(f"⚠️ {message.author.mention} DMに送信できませんでした。設定を確認してください。")
+                else:
+                    await message.channel.send("❌ PayPayリンクの受け取りに失敗しました。")
+            else:
+                await message.channel.send("❓ 一致する商品在庫がありません。")
+        except Exception as e:
+            print(f"Error: {e}")
 
-    pp, name = await require_login(interaction)
-    if not pp:
-        return
-
-    if amount <= 0:
-        await interaction.followup.send("❌ 金額は1円以上にしてください。", ephemeral=True)
-        return
-
-    try:
-        pp.send_money(amount=amount, receiver_id=receiver_id)
-        embed = discord.Embed(title=f"✅ 送金完了（{name}）", color=0x00FF00)
-        embed.add_field(name="送金額",   value=f"¥{amount:,}")
-        embed.add_field(name="送り先ID", value=receiver_id)
-        await interaction.followup.send(embed=embed, ephemeral=True)
-    except PayPayLoginError:
-        await interaction.followup.send("❌ トークンが無効です。`/paypay login` で再ログインしてください。", ephemeral=True)
-    except Exception as e:
-        await interaction.followup.send(f"❌ エラー: {e}", ephemeral=True)
-
-
-@paypay_group.command(name="request", description="送金リンクを生成する")
-@app_commands.describe(amount="請求金額（円）", passcode="パスワード（任意）")
-async def paypay_request(interaction: discord.Interaction, amount: int, passcode: str = ""):
-    if not await check_whitelist(interaction):
-        return
-    await interaction.response.defer(ephemeral=True)
-    from PayPaython_mobile import PayPayLoginError
-
-    pp, name = await require_login(interaction)
-    if not pp:
-        return
-
-    if amount <= 0:
-        await interaction.followup.send("❌ 金額は1円以上にしてください。", ephemeral=True)
-        return
-
-    try:
-        result = pp.create_link(amount=amount, passcode=passcode if passcode else None)
-        embed = discord.Embed(title=f"🔗 送金リンク生成完了（{name}）", color=0xFF0000)
-        embed.add_field(name="請求金額", value=f"¥{amount:,}", inline=True)
-        if passcode:
-            embed.add_field(name="パスワード", value=passcode, inline=True)
-        embed.add_field(name="リンク", value=result.link, inline=False)
-        await interaction.followup.send(embed=embed, ephemeral=True)
-    except PayPayLoginError:
-        await interaction.followup.send("❌ トークンが無効です。`/paypay login` で再ログインしてください。", ephemeral=True)
-    except Exception as e:
-        await interaction.followup.send(f"❌ エラー: {e}", ephemeral=True)
-
-
-@paypay_group.command(name="link_check", description="送金リンクの情報を確認する")
-@app_commands.describe(link="確認するリンク（URL または ID）")
-async def paypay_link_check(interaction: discord.Interaction, link: str):
-    if not await check_whitelist(interaction):
-        return
-    await interaction.response.defer(ephemeral=True)
-    from PayPaython_mobile import PayPayLoginError
-
-    pp, name = await require_login(interaction)
-    if not pp:
-        return
-
-    try:
-        r = pp.link_check(link)
-        embed = discord.Embed(title="🔍 リンク情報", color=0x0099FF)
-        embed.add_field(name="金額",       value=f"¥{r.amount:,}" if r.amount else "指定なし", inline=True)
-        embed.add_field(name="ステータス", value=r.status,                                      inline=True)
-        embed.add_field(name="パスワード", value="あり 🔒" if r.has_password else "なし",       inline=True)
-        await interaction.followup.send(embed=embed, ephemeral=True)
-    except PayPayLoginError:
-        await interaction.followup.send("❌ トークンが無効です。`/paypay login` で再ログインしてください。", ephemeral=True)
-    except Exception as e:
-        await interaction.followup.send(f"❌ エラー: {e}", ephemeral=True)
-
-
-@paypay_group.command(name="link_cancel", description="自分が作った送金リンクをキャンセルする")
-@app_commands.describe(link="キャンセルするリンク（URL または ID）")
-async def paypay_link_cancel(interaction: discord.Interaction, link: str):
-    if not await check_whitelist(interaction):
-        return
-    await interaction.response.defer(ephemeral=True)
-    from PayPaython_mobile import PayPayLoginError
-
-    pp, name = await require_login(interaction)
-    if not pp:
-        return
-
-    try:
-        link_info = pp.link_check(link)
-        pp.link_cancel(link, link_info=link_info)
-        embed = discord.Embed(title="✅ リンクキャンセル完了", color=0x888888)
-        embed.add_field(name="金額", value=f"¥{link_info.amount:,}" if link_info.amount else "不明")
-        await interaction.followup.send(embed=embed, ephemeral=True)
-    except PayPayLoginError:
-        await interaction.followup.send("❌ トークンが無効です。`/paypay login` で再ログインしてください。", ephemeral=True)
-    except Exception as e:
-        await interaction.followup.send(f"❌ エラー: {e}", ephemeral=True)
-
-
-@paypay_group.command(name="p2p", description="請求リンクを作成する")
-@app_commands.describe(amount="金額を指定する場合（任意）")
-async def paypay_p2p(interaction: discord.Interaction, amount: int = 0):
-    if not await check_whitelist(interaction):
-        return
-    await interaction.response.defer(ephemeral=True)
-    from PayPaython_mobile import PayPayLoginError
-
-    pp, name = await require_login(interaction)
-    if not pp:
-        return
-
-    try:
-        r = pp.create_p2pcode(amount=amount if amount > 0 else None)
-        embed = discord.Embed(title=f"🔗 請求リンク（{name}）", color=0xFF0000)
-        if amount > 0:
-            embed.add_field(name="指定金額", value=f"¥{amount:,}", inline=True)
-        embed.add_field(name="請求リンク", value=r.p2pcode, inline=False)
-        await interaction.followup.send(embed=embed, ephemeral=True)
-    except PayPayLoginError:
-        await interaction.followup.send("❌ トークンが無効です。`/paypay login` で再ログインしてください。", ephemeral=True)
-    except Exception as e:
-        await interaction.followup.send(f"❌ エラー: {e}", ephemeral=True)
-
-
-@paypay_group.command(name="search", description="PayPayIDでユーザーを検索する")
-@app_commands.describe(user_id="相手のPayPayID")
-async def paypay_search(interaction: discord.Interaction, user_id: str):
-    if not await check_whitelist(interaction):
-        return
-    await interaction.response.defer(ephemeral=True)
-    from PayPaython_mobile import PayPayLoginError
-
-    pp, name = await require_login(interaction)
-    if not pp:
-        return
-
-    try:
-        r = pp.search_p2puser(user_id=user_id)
-        embed = discord.Embed(title="🔍 ユーザー検索結果", color=0x0099FF)
-        embed.add_field(name="表示名",           value=r.name,             inline=True)
-        embed.add_field(name="External User ID", value=r.external_user_id, inline=False)
-        if r.icon:
-            embed.set_thumbnail(url=r.icon)
-        embed.set_footer(text="External User IDを /paypay send の receiver_id に使えます")
-        await interaction.followup.send(embed=embed, ephemeral=True)
-    except PayPayLoginError:
-        await interaction.followup.send("❌ トークンが無効です。`/paypay login` で再ログインしてください。", ephemeral=True)
-    except Exception as e:
-        await interaction.followup.send(f"❌ エラー: {e}", ephemeral=True)
-
-
-# ===== Select Views =====
-class SwitchSelect(discord.ui.Select):
-    def __init__(self, uid: int, accounts: list, active: str):
-        self.uid = uid
-        options = [
-            discord.SelectOption(label=a, value=a, default=(a == active), emoji="▶" if a == active else None)
-            for a in accounts
-        ]
-        super().__init__(placeholder="切り替えるアカウントを選択...", options=options)
-
-    async def callback(self, interaction: discord.Interaction):
-        set_active(self.uid, self.values[0])
-        await interaction.response.send_message(f"✅ **{self.values[0]}** に切り替えました。", ephemeral=True)
-        self.view.stop()
-
-class SwitchView(discord.ui.View):
-    def __init__(self, uid: int, accounts: list, active: str):
-        super().__init__(timeout=30)
-        self.add_item(SwitchSelect(uid, accounts, active))
-
-
-class DeleteSelect(discord.ui.Select):
-    def __init__(self, uid: int, accounts: list):
-        self.uid = uid
-        options = [discord.SelectOption(label=a, value=a, emoji="🗑️") for a in accounts]
-        super().__init__(placeholder="削除するアカウントを選択...", options=options)
-
-    async def callback(self, interaction: discord.Interaction):
-        delete_account(self.uid, self.values[0])
-        await interaction.response.send_message(f"🗑️ **{self.values[0]}** を削除しました。", ephemeral=True)
-        self.view.stop()
-
-class DeleteView(discord.ui.View):
-    def __init__(self, uid: int, accounts: list):
-        super().__init__(timeout=30)
-        self.add_item(DeleteSelect(uid, accounts))
-
-
-
-bot.tree.add_command(paypay_group)
-
-
-@app.route('/')
-def main():
-    return "Bot is running!"
-
-def run_flask():
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
-
-# Flaskを別スレッドで起動してRenderのポートチェックをパスさせる
-threading.Thread(target=run_flask, daemon=True).start()
-
-bot.run(DISCORD_TOKEN)
+bot.run(TOKEN)
