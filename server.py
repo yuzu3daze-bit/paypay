@@ -4,7 +4,11 @@ from discord import app_commands
 import json
 import os
 import requests
+import threading
 from datetime import datetime
+from flask import Flask
+
+app = Flask(__name__)
 
 # ===== 設定 =====
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -602,17 +606,16 @@ class DeleteView(discord.ui.View):
 
 
 bot.tree.add_command(paypay_group)
-bot.run(DISCORD_TOKEN)
 
 
 @app.route('/')
 def main():
-    return "Bot is localized and running!"
+    return "Bot is running!"
 
-def run():
+def run_flask():
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
 
 # Flaskを別スレッドで起動してRenderのポートチェックをパスさせる
-threading.Thread(target=run).start()
+threading.Thread(target=run_flask, daemon=True).start()
 
 bot.run(DISCORD_TOKEN)
