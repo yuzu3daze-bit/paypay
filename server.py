@@ -15,7 +15,7 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 LICENSE_KEY   = os.getenv("LICENSE_KEY")
 LOGIN_API_URL = "https://plogin-api.xvps.jp"
 USER_DATA_DIR  = "solo_user_data"
-ALLOWED_USERS  = [911353660414492752]  # 使用を許可するDiscordユーザーID
+ALLOWED_USERS  = [1455012819291340862]  # 使用を許可するDiscordユーザーID
 
 # ===== アクセス制御 =====
 def is_whitelisted(user_id: int) -> bool:
