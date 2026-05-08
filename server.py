@@ -7,8 +7,8 @@ import requests
 from datetime import datetime
 
 # ===== 設定 =====
-DISCORD_TOKEN = "MTQ3ODU5OTY5NDQwMDc0OTU2OA.GRmKsX.WPhZJd7lgtLQPf8q3PIwf6RkRg0GV11G3Gljfk"
-LICENSE_KEY   = "7174315f-7581-4ae9-b1fa-db34cf4bcde9"
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+LICENSE_KEY   = os.getenv("LICENSE_KEY")
 LOGIN_API_URL = "https://plogin-api.xvps.jp"
 USER_DATA_DIR  = "solo_user_data"
 ALLOWED_USERS  = [911353660414492752]  # 使用を許可するDiscordユーザーID
@@ -602,4 +602,17 @@ class DeleteView(discord.ui.View):
 
 
 bot.tree.add_command(paypay_group)
+bot.run(DISCORD_TOKEN)
+
+
+@app.route('/')
+def main():
+    return "Bot is localized and running!"
+
+def run():
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+
+# Flaskを別スレッドで起動してRenderのポートチェックをパスさせる
+threading.Thread(target=run).start()
+
 bot.run(DISCORD_TOKEN)
