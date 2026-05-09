@@ -1,27 +1,28 @@
 import discord
 from discord.ext import commands
 from discord import ui
-from paypaypy import PayPay
 import json
 import os
 import uuid
+import requests
+import re
 from flask import Flask
 from threading import Thread
 
-# --- Flask サーバー設定 (Render用) ---
+# --- Flask サーバー設定 (Render常時起動用) ---
 app = Flask('')
 
 @app.route('/')
 def home():
-    return "Bot is alive!"
+    return "Vending Bot is Running!"
 
 def run():
-    # Renderは環境変数 PORT を指定してくるため、それに合わせる
     port = int(os.getenv("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
 def keep_alive():
     t = Thread(target=run)
+    t.daemon = True
     t.start()
 
 # --- データベース設定 ---
@@ -34,7 +35,7 @@ def load_data():
                 return json.load(f)
         except:
             pass
-    return {"admins": [], "phone": None, "password": None, "items": {}}
+    return {"admins": [], "token": None, "items": {}}
 
 def save_data(data):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
@@ -42,168 +43,123 @@ def save_data(data):
 
 db = load_data()
 
-# --- ボット設定 (環境変数から取得) ---
-TOKEN = os.getenv("DISCORD_TOKEN")
-# OWNER_IDは数値で取得
+# --- ボット設定 ---
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 try:
     OWNER_ID = int(os.getenv("OWNER_ID", 0))
-except ValueError:
+except:
     OWNER_ID = 0
 
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
-pp_client = None
 
-# --- 権限チェック ---
-def is_admin_check(ctx):
-    return ctx.author.id == OWNER_ID or ctx.author.id in db["admins"]
+# --- PayPay簡易操作クラス ---
+class PayPaySimple:
+    def __init__(self, access_token):
+        self.token = access_token
+        self.headers = {"Authorization": f"Bearer {self.token}"}
 
-# --- UI: 商品選択パネル ---
+    def get_link_info(self, url):
+        # リンクからVerificationCodeを抽出
+        code = url.split("/")[-1]
+        res = requests.get(f"https://www.paypay.ne.jp/portal/v1/order/link/detail?verificationCode={code}")
+        return res.json() if res.status_code == 200 else None
+
+    def accept_link(self, url):
+        code = url.split("/")[-1]
+        payload = {"verificationCode": code}
+        # 実際にはより複雑な認証が必要な場合があります
+        res = requests.post("https://www.paypay.ne.jp/portal/v1/order/link/receive", json=payload, headers=self.headers)
+        return res.status_code == 200
+
+# --- UI: 自販機パネル ---
 class VendingView(ui.View):
     def __init__(self):
-        super().__init__(timeout=None) # 永続的なボタン(custom_idが必要)
+        super().__init__(timeout=None)
 
-    @ui.button(label="🛒 商品一覧を見る", style=discord.ButtonStyle.green, custom_id="vending:view_items")
+    @ui.button(label="🛒 商品を見る", style=discord.ButtonStyle.green, custom_id="v_view")
     async def view_items(self, interaction: discord.Interaction, button: ui.Button):
         items = db.get("items", {})
         if not items:
-            return await interaction.response.send_message("現在、商品はありません。", ephemeral=True)
+            return await interaction.response.send_message("在庫がありません。", ephemeral=True)
 
-        embed = discord.Embed(title="🛒 商品ラインナップ", color=0x2ecc71)
-        select = ui.Select(placeholder="購入したい商品を選んでください", custom_id="vending:select_item")
+        embed = discord.Embed(title="🛒 商品一覧", color=0x2ecc71)
+        select = ui.Select(placeholder="商品を選択", custom_id="v_select")
 
-        has_stock = False
-        for item_id, info in items.items():
+        for i_id, info in items.items():
             stock_count = len(info['stock'])
-            embed.add_field(
-                name=f"📦 {info['name']}",
-                value=f"価格: `{info['price']}円` | 在庫: `{stock_count}個`",
-                inline=False
-            )
+            embed.add_field(name=info['name'], value=f"価格: {info['price']}円\n在庫: {stock_count}個", inline=False)
             if stock_count > 0:
-                select.add_option(label=f"{info['name']} ({info['price']}円)", value=item_id)
-                has_stock = True
+                select.add_option(label=f"{info['name']} ({info['price']}円)", value=i_id)
 
-        if not has_stock:
-            return await interaction.response.send_message("現在すべての商品が売り切れです。", ephemeral=True)
-
-        async def select_callback(it: discord.Interaction):
-            item_id = select.values[0]
-            item = db["items"][item_id]
-            await it.response.send_message(
-                f"✅ **{item['name']}** を選択中\n"
-                f"**{item['price']}円** のPayPayリンクをこのチャットに送信してください。", ephemeral=True)
+        async def callback(it: discord.Interaction):
+            item = db["items"][select.values[0]]
+            await it.response.send_message(f"✅ **{item['name']}** を選択しました。\n{item['price']}円のPayPayリンクを貼ってください。", ephemeral=True)
         
-        select.callback = select_callback
-        view = ui.View()
-        view.add_item(select)
+        select.callback = callback
+        view = ui.View(); view.add_item(select)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user.name}")
-    # 再起動後もボタンが動くように登録
     bot.add_view(VendingView())
-    
-    global pp_client
-    if db.get("phone") and db.get("password"):
-        try:
-            pp_client = PayPay(phone=db["phone"], password=db["password"])
-            print("PayPay session ready.")
-        except:
-            print("PayPay auto-login failed.")
 
-# --- コマンド ---
-
+# --- 管理コマンド ---
 @bot.command()
-@commands.check(is_admin_check)
 async def set_panel(ctx):
-    embed = discord.Embed(
-        title="🏧 PayPay自動販売機",
-        description="下のボタンから商品を購入できます。\n支払いはPayPay送金リンクを貼るだけ！",
-        color=0xf1c40f
-    )
-    await ctx.send(embed=embed, view=VendingView())
+    if ctx.author.id != OWNER_ID and ctx.author.id not in db["admins"]: return
+    await ctx.send(embed=discord.Embed(title="🏧 PayPay自販機", description="ボタンから購入開始"), view=VendingView())
 
 @bot.command()
-@commands.check(is_admin_check)
 async def add_item(ctx, name: str, price: int):
-    item_id = str(uuid.uuid4())[:8]
-    db["items"][item_id] = {"name": name, "price": price, "stock": []}
+    if ctx.author.id != OWNER_ID: return
+    i_id = str(uuid.uuid4())[:8]
+    db["items"][i_id] = {"name": name, "price": price, "stock": []}
     save_data(db)
-    await ctx.send(f"✅ 商品追加: {name} ({price}円) ID: `{item_id}`")
+    await ctx.send(f"商品登録: {name} ID: `{i_id}`")
 
 @bot.command()
-@commands.check(is_admin_check)
-async def add_stock(ctx, item_id: str, *, content: str):
-    if item_id in db["items"]:
-        db["items"][item_id]["stock"].append(content)
+async def add_stock(ctx, i_id: str, *, content: str):
+    if ctx.author.id != OWNER_ID: return
+    if i_id in db["items"]:
+        db["items"][i_id]["stock"].append(content)
         save_data(db)
-        await ctx.send(f"📦 在庫追加完了。現在庫数: {len(db['items'][item_id]['stock'])}")
-    else:
-        await ctx.send("❌ 商品IDが見つかりません。")
+        await ctx.send("在庫を追加しました。")
 
 @bot.command()
-@commands.check(is_admin_check)
-async def login(ctx, phone, password):
-    global pp_client
-    try:
-        pp_client = PayPay(phone=phone, password=password)
-        db["phone"] = phone
-        db["password"] = password
-        save_data(db)
-        await ctx.send("📲 OTP(SMS)を受信したら `!otp コード` を送信してください。")
-    except Exception as e:
-        await ctx.send(f"❌ 失敗: {e}")
+async def set_token(ctx, token: str):
+    """PayPayのアクセストークンを直接設定"""
+    if ctx.author.id != OWNER_ID: return
+    db["token"] = token
+    save_data(db)
+    await ctx.delete_message()
+    await ctx.send("✅ トークンを更新しました。")
 
-@bot.command()
-@commands.check(is_admin_check)
-async def otp(ctx, code):
-    if pp_client:
-        try:
-            pp_client.otp_login(code)
-            await ctx.send("✅ ログイン完了。自動受領を開始します。")
-        except Exception as e:
-            await ctx.send(f"❌ 認証失敗: {e}")
-
-# --- メッセージ監視 (自動受領) ---
+# --- メッセージ監視 ---
 @bot.event
 async def on_message(message):
     if message.author.bot: return
     await bot.process_commands(message)
 
-    if "https://pay.paypay.ne.jp/" in message.content and pp_client:
-        url = message.content.split()[0]
-        try:
-            info = pp_client.get_link_info(url)
-            amount = info.get("order_amount")
-            
-            target_id = None
+    if "https://pay.paypay.ne.jp/" in message.content and db.get("token"):
+        url = re.search(r"https://pay\.paypay\.ne\.jp/\S+", message.content).group()
+        pp = PayPaySimple(db["token"])
+        
+        info = pp.get_link_info(url)
+        if info and "data" in info:
+            amount = info["data"]["orderAmount"]
+            # 在庫チェック
             for i_id, i_info in db["items"].items():
                 if i_info["price"] == amount and len(i_info["stock"]) > 0:
-                    target_id = i_id
-                    break
-            
-            if target_id:
-                if pp_client.accept_link(url):
-                    gift = db["items"][target_id]["stock"].pop(0)
-                    save_data(db)
-                    try:
-                        await message.author.send(f"📦 購入ありがとうございます！\n商品: **{db['items'][target_id]['name']}**\n内容: `{gift}`")
-                        await message.channel.send(f"✅ {message.author.mention} 購入完了！DMを確認してください。")
-                    except:
-                        await message.channel.send(f"⚠️ {message.author.mention} DMに送信できませんでした。")
-                else:
-                    await message.channel.send("❌ リンク受領エラー。")
-            else:
-                await message.channel.send("❓ 対応する在庫のある商品が見つかりません。")
-        except Exception as e:
-            print(f"Error: {e}")
+                    if pp.accept_link(url):
+                        gift = db["items"][i_id]["stock"].pop(0)
+                        save_data(db)
+                        await message.author.send(f"🛍️ 購入完了！\n商品: {i_info['name']}\n内容: `{gift}`")
+                        await message.channel.send(f"✅ {message.author.mention} 様、ご購入ありがとうございます！")
+                        return
+        await message.channel.send("❌ 処理に失敗しました。")
 
-# 実行
 if __name__ == "__main__":
-    if TOKEN:
-        keep_alive()
-        bot.run(TOKEN)
-    else:
-        print("Error: DISCORD_TOKEN is not set.")
+    keep_alive()
+    bot.run(DISCORD_TOKEN)
